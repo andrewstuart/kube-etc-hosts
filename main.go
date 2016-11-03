@@ -1,0 +1,182 @@
+// Copyright 2016 Andrew Stuart
+
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+
+//     http://www.apache.org/licenses/LICENSE-2.0
+
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package main
+
+import (
+	"bytes"
+	"flag"
+	"fmt"
+	"io/ioutil"
+	"log"
+	"os"
+	"regexp"
+	"text/template"
+
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/pkg/api/v1"
+	"k8s.io/client-go/pkg/watch"
+	"k8s.io/client-go/rest"
+)
+
+const (
+	k8sNeedle = "##BEGIN K8S HOSTS##\n"
+	zoneTmpl  = k8sNeedle + "{{ range $ip, $names := .ips }}{{ $ip }}\t{{ range $hostname := $names }} {{$hostname}}{{end}}\n{{end}}"
+)
+
+var (
+	inCluster = flag.Bool("incluster", false, "the client is running inside a kuberenetes cluster")
+	once      = flag.Bool("once", false, "Write the file and then exit; do not watch for ingress changes")
+	filepath  = flag.String("filepath", "zones/k8s-zones.cluster.local", "File location for zone file")
+	kubeHost  = flag.String("host", "", "The kubernetes v1 host; required if not run in-cluster")
+
+	spaceRE = regexp.MustCompile("[[:space:]]+")
+	ztpl    = template.Must(template.New("bind9").Parse(zoneTmpl))
+)
+
+func init() {
+	flag.Parse()
+}
+
+func main() {
+	var config *rest.Config
+
+	if *inCluster {
+		var err error
+		config, err = rest.InClusterConfig()
+		if err != nil {
+			log.Fatal("Error getting in-cluster config: ", err)
+		}
+	} else {
+		if *kubeHost == "" {
+			flag.Usage()
+			log.Fatal("Must run with -incluster (inside a k8s cluster) or provide a kubernetes host via -host")
+		}
+		config = &rest.Config{
+			Host: *kubeHost,
+		}
+	}
+
+	cli, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		log.Fatal("Error creating v1 client: ", err)
+	}
+
+	if !*once {
+		log.Fatal(watchIng(cli))
+	}
+
+	if err := createBindFile(cli); err != nil {
+		log.Fatal("Bind file creation error ", err)
+	}
+}
+
+func createBindFile(c *kubernetes.Clientset) error {
+	ingresses := map[string][]string{}
+
+	ings, err := c.Ingresses("").List(v1.ListOptions{})
+	if err != nil {
+		return err
+	}
+
+	for _, ing := range ings.Items {
+		log.Println(ing.Name)
+
+		if len(ing.Status.LoadBalancer.Ingress) < 1 {
+			log.Println("No ingresses to load for ", ing)
+			continue
+		}
+
+		ip := ing.Status.LoadBalancer.Ingress[0].IP
+
+		if ingresses[ip] == nil {
+			ingresses[ip] = []string{}
+		}
+
+		for _, rule := range ing.Spec.Rules {
+			host := rule.Host
+
+			if host == "" {
+				log.Printf("Not adding empty host entry for ingress %s (was %s)\n", ing.Name, rule.Host)
+				continue
+			}
+
+			a := append(ingresses[ip], host)
+			ingresses[ip] = a
+		}
+	}
+	log.Println()
+
+	prev, err := getOrig()
+	if err != nil {
+		return err
+	}
+
+	f, err := os.OpenFile(*filepath, os.O_CREATE|os.O_TRUNC|os.O_RDWR, 0640)
+	if err != nil {
+		return err
+	}
+
+	f.Write(prev)
+
+	err = ztpl.Execute(f, map[string]interface{}{"ips": ingresses})
+	if err != nil {
+		return err
+	}
+
+	err = f.Close()
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func getOrig() ([]byte, error) {
+	bs, err := ioutil.ReadFile(*filepath)
+	if err != nil {
+		return nil, err
+	}
+
+	arr := bytes.Split(bs, []byte(k8sNeedle))
+
+	if arr == nil || len(arr) < 1 {
+		return nil, fmt.Errorf("No result from splitting bytes")
+	}
+
+	return arr[0], nil
+}
+
+func watchIng(cli *kubernetes.Clientset) error {
+	for {
+		w, err := cli.Ingresses("").Watch(v1.ListOptions{})
+		if err != nil {
+			return fmt.Errorf("Watch error %s", err)
+		}
+
+		for evt := range w.ResultChan() {
+			et := watch.EventType(evt.Type)
+			if et != watch.Added && et != watch.Modified {
+				continue
+			}
+
+			err = createBindFile(cli)
+			if err != nil {
+				return err
+			}
+		}
+
+		log.Println("Result channel closed. Starting again.")
+	}
+}

@@ -1,0 +1,33 @@
+apiVersion: extensions/v1beta1
+kind: Deployment
+metadata:
+  name: kube-etc-hosts
+spec:
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: kube-etc-hosts
+        tier: development
+    spec:
+      terminationGracePeriodSeconds: 0
+      containers:
+      - name: kube-etc-hosts
+        image: andrewstuart/kube-etc-hosts
+        imagePullPolicy: Always
+        command: "/kube-etc-hosts"
+        args:
+          - "-incluster"
+          - "/hosts"
+        resources:
+          requests: &r
+            cpu: 20m
+            memory: 100Mi
+          limits: *r
+        volumeMounts:
+        - name: hosts
+          mountPath: /hosts
+      volumes:
+      - name: hosts
+        hostPath:
+          path: /etc/hosts
