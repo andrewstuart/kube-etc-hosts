@@ -32,5 +32,3 @@ _testmain.go
 *.out
 
 zones
-
-vendor
