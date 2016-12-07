@@ -31,15 +31,17 @@ import (
 )
 
 const (
-	k8sNeedle = "##BEGIN K8S HOSTS##\n"
-	zoneTmpl  = k8sNeedle + "{{ range $ip, $names := .ips }}{{ $ip }}\t{{ range $hostname := $names }} {{$hostname}}{{end}}\n{{end}}"
+	k8sNeedle      = "\n\n##BEGIN K8S HOSTS##\n"
+	zoneTmpl       = k8sNeedle + "{{ range $ip, $names := .ips }}{{ $ip }}\t{{ range $hostname := $names }} {{$hostname}}{{end}}\n{{end}}"
+	defaultMaxErrs = 10
 )
 
 var (
 	inCluster = flag.Bool("incluster", false, "the client is running inside a kuberenetes cluster")
 	once      = flag.Bool("once", false, "Write the file and then exit; do not watch for ingress changes")
-	filepath  = flag.String("filepath", "zones/k8s-zones.cluster.local", "File location for zone file")
+	filepath  = flag.String("filepath", "/etc/hosts", "File location for zone file")
 	kubeHost  = flag.String("host", "", "The kubernetes v1 host; required if not run in-cluster")
+	maxErrs   = flag.Int("max-errs", defaultMaxErrs, "The number of errors acceptable before quitting")
 
 	spaceRE = regexp.MustCompile("[[:space:]]+")
 	ztpl    = template.Must(template.New("bind9").Parse(zoneTmpl))
@@ -47,10 +49,22 @@ var (
 
 func init() {
 	flag.Parse()
+
+	if *maxErrs < 0 {
+		*maxErrs = defaultMaxErrs
+	}
 }
 
 func main() {
 	var config *rest.Config
+
+	// sigs := make(chan os.Signal)
+	// go signal.Notify(sigs, os.Kill, os.Interrupt)
+	// go func() {
+	// 	for sig := range sigs {
+
+	// 	}
+	// }()
 
 	if *inCluster {
 		var err error
@@ -73,12 +87,39 @@ func main() {
 		log.Fatal("Error creating v1 client: ", err)
 	}
 
+	defer cleanup()
+
 	if !*once {
 		log.Fatal(watchIng(cli))
 	}
 
-	if err := createBindFile(cli); err != nil {
-		log.Fatal("Bind file creation error ", err)
+	numErrs := 0
+	for {
+		if err := createBindFile(cli); err != nil {
+			numErrs++
+			log.Println("Bind file creation error ", err)
+			if numErrs > *maxErrs {
+				os.Exit(1)
+			}
+		}
+	}
+}
+
+func cleanup() {
+	orig, err := getOrig()
+	if err != nil {
+		log.Fatal("Error during cleanup while reading original file", err)
+	}
+
+	f, err := os.OpenFile(*filepath, os.O_CREATE|os.O_TRUNC|os.O_RDWR, 0640)
+	if err != nil {
+		log.Fatal("Error during cleanup while opening file for write", err)
+	}
+	defer f.Close()
+
+	_, err = f.Write(orig)
+	if err != nil {
+		log.Fatal("Error during cleanup while writing original file state", err)
 	}
 }
 
@@ -135,12 +176,7 @@ func createBindFile(c *kubernetes.Clientset) error {
 		return err
 	}
 
-	err = f.Close()
-	if err != nil {
-		return err
-	}
-
-	return nil
+	return f.Close()
 }
 
 func getOrig() ([]byte, error) {
